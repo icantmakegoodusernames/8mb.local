@@ -1,7 +1,10 @@
-# Multi-stage unified 8mb.local container
-# Stage 1: Build FFmpeg with NVIDIA NVENC GPU support + CPU encoders
-# Use CUDA 12.2 devel image: supports RTX 50-series and is compatible with NVIDIA driver 535+
-FROM nvidia/cuda:12.2.0-devel-ubuntu22.04 AS ffmpeg-build
+# Multi-stage unified 8mb.local container — CPU-only, ARM64 (aarch64) build.
+# Difference vs upstream: NVIDIA/CUDA base images swapped for plain Ubuntu, and
+# the NVENC/CUDA pieces removed from the FFmpeg build. All CPU encoders (x264,
+# x265, SVT-AV1, VP8/9, AV1, Opus) are unchanged, so the app behaves the same.
+
+# ── Stage 1: Build FFmpeg with CPU encoders only ───────────────────────────────
+FROM ubuntu:22.04 AS ffmpeg-build
 
 ENV DEBIAN_FRONTEND=noninteractive
 RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
@@ -13,16 +16,9 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
 
 WORKDIR /build
 
-# NVIDIA NVENC headers
-# Pin to NVENC API 12.1 for widest compatibility with driver 535.x, while CUDA 12.2 runtime covers RTX 50‑series
-RUN git clone https://git.videolan.org/git/ffmpeg/nv-codec-headers.git && \
-    cd nv-codec-headers && git checkout sdk/12.1 && make install && cd ..
-
-# SVT-AV1: Ubuntu 22.04's libsvtav1 (0.9.x) is too old for FFmpeg 6.1's libsvtav1 glue
-# (e.g. EbSvtAv1EncConfiguration.force_key_frames). Build a current release from source.
-# Canonical upstream is on GitLab (the GitHub mirror has no release tags).
-# Must match FFmpeg's bundled libsvtav1.c: FFmpeg 6.1.x targets SVT-AV1 2.x API;
-# SVT 3.x changed ``svt_av1_enc_init_handle`` and breaks the build.
+# SVT-AV1: Ubuntu 22.04's packaged libsvtav1 is too old for FFmpeg 6.1's glue.
+# Build a current release from source (has ARM NEON support). Must stay on the
+# SVT-AV1 2.x API that FFmpeg 6.1.x targets (3.x changes break the build).
 ARG SVTAV1_VERSION=v2.2.1
 RUN git clone --depth 1 --branch ${SVTAV1_VERSION} https://gitlab.com/AOMediaCodec/SVT-AV1.git && \
     cd SVT-AV1/Build && \
@@ -30,23 +26,19 @@ RUN git clone --depth 1 --branch ${SVTAV1_VERSION} https://gitlab.com/AOMediaCod
     cmake --build . -j"$(nproc)" && cmake --install . && ldconfig && \
     cd /build && rm -rf SVT-AV1
 
-# Build FFmpeg with NVIDIA NVENC + CPU encoders
+# Build FFmpeg 6.1.1 with CPU encoders (no CUDA / NVENC).
 RUN wget -q https://ffmpeg.org/releases/ffmpeg-6.1.1.tar.xz && \
-        tar xf ffmpeg-6.1.1.tar.xz && cd ffmpeg-6.1.1 && \
-                ./configure \
-      --enable-nonfree --enable-gpl \
-      --enable-cuda-nvcc --enable-libnpp --enable-nvenc \
-      --enable-libx264 --enable-libx265 --enable-libvpx --enable-libopus --enable-libaom --enable-libsvtav1 --enable-libdav1d \
-      --extra-cflags=-I/usr/local/cuda/include \
-      --extra-ldflags=-L/usr/local/cuda/lib64 \
+    tar xf ffmpeg-6.1.1.tar.xz && cd ffmpeg-6.1.1 && \
+    ./configure \
+      --enable-gpl \
+      --enable-libx264 --enable-libx265 --enable-libvpx --enable-libopus \
+      --enable-libaom --enable-libsvtav1 --enable-libdav1d \
       --disable-doc --disable-htmlpages --disable-manpages --disable-podpages --disable-txtpages && \
-    make -j$(nproc) && make install && ldconfig && \
-    # Strip binaries to reduce size
+    make -j"$(nproc)" && make install && ldconfig && \
     strip --strip-all /usr/local/bin/ffmpeg /usr/local/bin/ffprobe && \
-    # Clean up build artifacts
-        cd .. && rm -rf ffmpeg-6.1.1 ffmpeg-6.1.1.tar.xz nv-codec-headers /build
+    cd .. && rm -rf ffmpeg-6.1.1 ffmpeg-6.1.1.tar.xz /build
 
-# Stage 2: Build Frontend
+# ── Stage 2: Build Frontend (unchanged; node:20-alpine is multi-arch) ─────────
 FROM node:20-alpine AS frontend-build
 
 WORKDIR /frontend
@@ -55,18 +47,14 @@ RUN --mount=type=cache,target=/root/.npm \
     npm ci
 
 COPY frontend/ ./
-# Build with empty backend URL (same-origin deployment)
 ENV PUBLIC_BACKEND_URL=""
 RUN npm run build && \
-    # Remove source maps and unnecessary files to reduce size
     find build -name "*.map" -delete && \
     find build -name "*.ts" -delete
 
-# Stage 3: Runtime with all services
-# Use CUDA 12.2 runtime: minimum driver 535; supports RTX 50-series and older (535+) systems
-FROM nvidia/cuda:12.2.0-runtime-ubuntu22.04
+# ── Stage 3: Runtime (CPU-only, no CUDA) ──────────────────────────────────────
+FROM ubuntu:22.04
 
-# Build-time version (can be overridden)
 ARG BUILD_VERSION=137
 ENV APP_VERSION=${BUILD_VERSION}
 ARG BUILD_COMMIT=unknown
@@ -84,12 +72,10 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     libaom3 libdav1d5 \
     && apt-get clean && rm -rf /tmp/*
 
-# Copy FFmpeg from build stage (only what we need)
+# Copy the FFmpeg we built (binaries + its shared libs, incl. SVT-AV1).
 COPY --from=ffmpeg-build /usr/local/bin/ffmpeg /usr/local/bin/ffmpeg
 COPY --from=ffmpeg-build /usr/local/bin/ffprobe /usr/local/bin/ffprobe
-# SVT-AV1 is built from source in ffmpeg-build (not Ubuntu packages)
 COPY --from=ffmpeg-build /usr/local/lib/libSvtAv1Enc.so* /usr/local/lib/
-# Copy only FFmpeg libraries (not entire /usr/local/lib)
 COPY --from=ffmpeg-build /usr/local/lib/libavcodec.so* /usr/local/lib/
 COPY --from=ffmpeg-build /usr/local/lib/libavformat.so* /usr/local/lib/
 COPY --from=ffmpeg-build /usr/local/lib/libavutil.so* /usr/local/lib/
@@ -101,40 +87,27 @@ RUN ldconfig
 
 WORKDIR /app
 
-# Install Python dependencies (single consolidated requirements)
 COPY requirements.txt /app/requirements.txt
 RUN --mount=type=cache,target=/root/.cache/pip \
     pip3 install --no-cache-dir -r /app/requirements.txt && \
     rm /app/requirements.txt && \
-    # Remove pip cache and unnecessary files
     find /usr/local/lib/python3.10 -type d -name '__pycache__' -exec rm -rf {} + 2>/dev/null || true && \
     find /usr/local/lib/python3.10 -type f -name '*.pyc' -delete && \
     find /usr/local/lib/python3.10 -type f -name '*.pyo' -delete
 
-# Copy application code
 COPY backend-api/app /app/backend
 COPY worker/app /app/worker
-
-# Copy pre-built frontend
 COPY --from=frontend-build /frontend/build /app/frontend-build
 
-# Embed build metadata for runtime introspection
 RUN echo "Version: ${APP_VERSION}" > /app/VERSION && \
     echo "Commit: ${BUILD_COMMIT}" >> /app/VERSION && \
     echo -n "Built: " >> /app/VERSION && date -u +%FT%TZ >> /app/VERSION && \
     echo "FFmpeg: $(ffmpeg -version | head -n1)" >> /app/VERSION
 
-# Create necessary directories
 RUN mkdir -p /app/uploads /app/outputs /var/log/supervisor /var/lib/redis /var/log/redis
 
-# Set NVIDIA driver capabilities for NVENC/NVDEC support
-ENV NVIDIA_DRIVER_CAPABILITIES=compute,video,utility
-ENV NVIDIA_VISIBLE_DEVICES=all
-
-# Configure supervisord
 COPY supervisord.conf /etc/supervisor/conf.d/supervisord.conf
 
-# Container entrypoint sets up NVIDIA library paths
 COPY entrypoint.sh /app/entrypoint.sh
 RUN chmod +x /app/entrypoint.sh
 
