@@ -64,10 +64,14 @@ ENV DEBIAN_FRONTEND=noninteractive
 ENV PYTHONUNBUFFERED=1
 ENV PYTHONDONTWRITEBYTECODE=1
 
+# NOTE: build-essential + python3-dev are needed because psutil has no prebuilt
+# aarch64 wheel and must be compiled from source on ARM. Without a C compiler
+# the pip install below fails, which leaves the app with no dependencies.
 RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     --mount=type=cache,target=/var/lib/apt,sharing=locked \
     apt-get update && apt-get install -y --no-install-recommends \
-    python3.10 python3-pip supervisor redis-server \
+    python3.10 python3-pip python3-dev build-essential \
+    supervisor redis-server \
     libopus0 libx264-163 libx265-199 libvpx7 libnuma1 \
     libaom3 libdav1d5 \
     && apt-get clean && rm -rf /tmp/*
@@ -91,7 +95,7 @@ COPY requirements.txt /app/requirements.txt
 RUN --mount=type=cache,target=/root/.cache/pip \
     pip3 install --no-cache-dir -r /app/requirements.txt && \
     rm /app/requirements.txt && \
-    find /usr/local/lib/python3.10 -type d -name '__pycache__' -exec rm -rf {} + 2>/dev/null || true && \
+    { find /usr/local/lib/python3.10 -type d -name '__pycache__' -exec rm -rf {} + 2>/dev/null || true; } && \
     find /usr/local/lib/python3.10 -type f -name '*.pyc' -delete && \
     find /usr/local/lib/python3.10 -type f -name '*.pyo' -delete
 
